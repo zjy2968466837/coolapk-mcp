@@ -41,9 +41,9 @@ def _output(data):
 
 
 def _output_error(err: CoolapkError):
-    """错误输出"""
+    """错误输出（error_type 供调用方区分 captcha/网络/业务错误，避免盲目重试）"""
     click.echo(json.dumps(
-        {"error": err.message, "code": err.error_code},
+        {"error": err.message, "code": err.error_code, "error_type": err.kind},
         ensure_ascii=False,
     ))
     sys.exit(1)
@@ -162,23 +162,32 @@ async def secondhand(brand, page):
 @click.option("--reply-page", default=1, type=int)
 @click.option("--feed-type", default="feed",
               type=click.Choice(["feed", "trade", "feedArticle"]))
+@click.option("--uid", "author_uid", type=int, default=None,
+              help="作者UID（详情接口被风控时用于回落，不提供则自动查本地索引）")
+@click.option("--all-replies", is_flag=True,
+              help="拉全部一级评论（自动翻页，含内联楼中楼）")
+@click.option("--grep", "comment_keyword", default=None,
+              help="按关键词检索评论/楼中楼（隐含 --all-replies；空格分隔多词=任一命中）")
 @async_command
-async def feed(feed_id, replies, reply_page, feed_type):
-    """动态详情"""
+async def feed(feed_id, replies, reply_page, feed_type, author_uid, all_replies, comment_keyword):
+    """动态详情（详情接口被验证码拦截时自动从作者动态列表回落）"""
     async with CoolapkClient() as client:
-        raw = await client.get_feed_detail(feed_id)
-        if isinstance(raw, list) and raw:
-            raw = raw[0]
-        if not isinstance(raw, dict):
-            _output(raw)
-            return
-        reply_data = None
-        if replies:
-            reply_data = await client.get_feed_replies(feed_id, reply_page)
-        detail = FeedDetail.from_api(
-            raw, reply_data if isinstance(reply_data, list) else None
+        smart = await client.get_feed_detail_smart(
+            feed_id, author_uid=author_uid,
+            with_replies=replies or bool(comment_keyword),
+            reply_page=reply_page,
+            all_replies=all_replies or bool(comment_keyword),
         )
-    _output(detail)
+        detail = FeedDetail.from_api(
+            smart["data"],
+            smart["replies"] if isinstance(smart["replies"], list) else None,
+            fetch_source=smart["source"],
+        )
+    data = _dump(detail)
+    if comment_keyword:
+        from coolapk_mcp import postfilter
+        data = postfilter.filter_comments(data, comment_keyword)
+    _output(data)
 
 
 # ---- 搜索 ----
@@ -189,31 +198,26 @@ async def feed(feed_id, replies, reply_page, feed_type):
 @click.option("--type", "search_type", default="feed",
               type=click.Choice(["feed", "user", "feedTopic", "app"]))
 @click.option("--page", default=1, type=int)
+@click.option("--strict/--no-strict", default=True,
+              help="严格关键词过滤（默认开）：归一化后每个关键词都需命中标题/正文/作者名")
+@click.option("--meta", is_flag=True, help="输出过滤统计信息（默认只输出结果列表）")
 @async_command
-async def search(keyword, search_type, page):
-    """搜索内容"""
+async def search(keyword, search_type, page, strict, meta):
+    """搜索内容（自动去重 + 严格过滤 + 疑似广告标记）"""
+    from coolapk_mcp import postfilter
+
     async with CoolapkClient() as client:
         raw = await client.search(keyword, search_type, page)
     if not isinstance(raw, list):
         _output(raw)
         return
-    results = []
-    for item in raw:
-        if not isinstance(item, dict):
-            results.append(item)
-            continue
-        et = item.get("entityType", "")
-        if et == "feed":
-            results.append(FeedModel.from_api(item))
-        elif et == "user":
-            results.append(UserModel.from_api(item))
-        elif et in ("topic", "tag"):
-            results.append(TopicModel.from_api(item))
-        elif et == "app":
-            results.append(AppModel.from_api(item))
-        else:
-            results.append(item)
-    _output(results)
+    use_strict = strict and search_type == "feed"
+    kept, counts = postfilter.filter_search_results(raw, keyword, strict=use_strict)
+    results = postfilter.convert_search_items(kept)
+    if meta:
+        _output({"counts": counts, "results": results})
+    else:
+        _output(results)
 
 
 # ---- 用户 ----

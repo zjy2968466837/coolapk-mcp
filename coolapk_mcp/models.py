@@ -121,9 +121,14 @@ class FeedDetail(FeedModel):
     source_feed: FeedModel | None = None
     replies: list[ReplyModel] = Field(default_factory=list)
     reply_count: int = 0
+    # 详情获取路径：api（详情接口）或 author_feed_fallback（风控回落，从作者动态列表读取）
+    fetch_source: str = ""
 
     @classmethod
-    def from_api(cls, data: dict, replies: list[dict] | None = None) -> FeedDetail:
+    def from_api(
+        cls, data: dict, replies: list[dict] | None = None,
+        fetch_source: str = "",
+    ) -> FeedDetail:
         user_info = data.get("userInfo") or {}
         pics = data.get("picArr") or data.get("pic") or []
         source = data.get("forwardSourceFeed")
@@ -149,6 +154,7 @@ class FeedDetail(FeedModel):
             source_feed=source_feed,
             replies=parsed_replies,
             reply_count=data.get("replyRowsCount", 0) or data.get("replynum", 0),
+            fetch_source=fetch_source,
         )
 
 
@@ -162,8 +168,12 @@ class ReplyModel(BaseModel):
     dateline: str = ""
     is_author: bool = Field(alias="isFeedAuthor", default=False)
     images: list[str] = Field(default_factory=list)
+    # 楼中楼：子回复总数 + 内联子回复（服务端默认只带最近几条）
+    reply_count: int = Field(alias="replynum", default=0)
+    reply_to: str = Field(alias="rusername", default="")
+    sub_replies: list["ReplyModel"] = Field(default_factory=list)
 
-    @field_validator("message", "username", mode="before")
+    @field_validator("message", "username", "reply_to", mode="before")
     @classmethod
     def _ensure_string_fields(cls, v: Any) -> str:
         return _ensure_string(v)
@@ -187,15 +197,23 @@ class ReplyModel(BaseModel):
     def from_api(cls, data: dict) -> ReplyModel:
         user_info = data.get("userInfo") or {}
         pics = data.get("picArr") or data.get("pic") or []
+        reply_rows = data.get("replyRows") or []
         return cls(
             id=data.get("id", 0),
             message=data.get("message", ""),
             username=user_info.get("username", ""),
-            uid=user_info.get("uid", 0),
+            uid=user_info.get("uid", 0) or data.get("uid", 0),
             likenum=data.get("likenum", 0),
             dateline=data.get("dateline", 0),
             isFeedAuthor=bool(data.get("isFeedAuthor", 0)),
             images=_extract_pics(pics),
+            replynum=data.get("replynum", 0),
+            rusername=data.get("rusername", "") or "",
+            sub_replies=[
+                ReplyModel.from_api(sub)
+                for sub in reply_rows
+                if isinstance(sub, dict)
+            ],
         )
 
 

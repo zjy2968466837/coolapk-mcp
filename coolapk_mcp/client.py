@@ -1,21 +1,29 @@
 """HTTP 客户端 + API 封装 — 合并网络层和业务端点"""
 
 import json
+import time
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
 import httpx
 
+from coolapk_mcp import throttle
 from coolapk_mcp.auth.token_v3 import DEFAULT_APP_VERSION, DEFAULT_VERSION_CODE, generate_token_v3
 from coolapk_mcp.config import AppConfig
 
 
 class CoolapkError(Exception):
-    """API 业务错误"""
+    """API 业务错误
 
-    def __init__(self, message: str, error_code: int = -1):
+    kind: api(服务端业务错误) captcha(风控验证码) network(超时/连接)
+          transient(5xx/429等可重试) http(其他HTTP错误) parse(响应解析失败)
+    """
+
+    def __init__(self, message: str, error_code: int = -1, kind: str = "api"):
         self.message = message
         self.error_code = error_code
+        self.kind = kind
         super().__init__(message)
 
 
@@ -24,9 +32,61 @@ class CoolapkClient:
 
     BASE_URL = "https://api.coolapk.com"
 
+    # 端点被验证码拦截后的冷却期（秒）：期间不再撞该端点，直接走回落
+    CAPTCHA_COOLDOWN = 600.0
+    # 详情回落时最多翻作者动态的页数
+    FALLBACK_SCAN_PAGES = 3
+    # feed_id → 作者uid 索引，持久化到 ~/.coolapk-mcp/uid_index.json
+    INDEX_FILE = Path.home() / ".coolapk-mcp" / "uid_index.json"
+    INDEX_MAX = 2000
+
     def __init__(self, config: AppConfig | None = None):
         self.config = config or AppConfig.load()
         self._client = httpx.AsyncClient(timeout=30.0)
+        self._limiter = throttle.RateLimiter()
+        self._cache = throttle.TTLCache()
+        self._blocked: dict[str, float] = {}
+        self._uid_index: dict[int, int] = {}
+        self._load_uid_index()
+
+    # ---- feed_id → uid 索引（详情回落的关键） ----
+
+    def _load_uid_index(self) -> None:
+        try:
+            data = json.loads(self.INDEX_FILE.read_text(encoding="utf-8"))
+            self._uid_index = {int(k): int(v) for k, v in data.items()}
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            self._uid_index = {}
+
+    def _save_uid_index(self) -> None:
+        try:
+            self.INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
+            trimmed = dict(list(self._uid_index.items())[-self.INDEX_MAX:])
+            self.INDEX_FILE.write_text(json.dumps(trimmed), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _index_feeds(self, data: Any) -> None:
+        """从列表响应记录 feed_id → 作者uid，供详情被风控时回落"""
+        if not isinstance(data, list):
+            return
+        changed = False
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            if item.get("entityType") not in ("feed", None):
+                continue
+            fid = item.get("id")
+            uid = item.get("uid") or (item.get("userInfo") or {}).get("uid")
+            if not fid or not uid:
+                continue
+            try:
+                self._uid_index[int(fid)] = int(uid)
+                changed = True
+            except (TypeError, ValueError):
+                continue
+        if changed:
+            self._save_uid_index()
 
     def _build_headers(self) -> dict[str, str]:
         """组装请求头，每次请求重新生成 X-App-Token（v3 算法）"""
@@ -59,29 +119,53 @@ class CoolapkClient:
         return f"uid={self.config.uid}; username={quote(self.config.username, safe='')}; token={self.config.token}"
 
     async def _request(self, method: str, path: str, **kwargs) -> Any:
-        """统一请求方法"""
-        url = f"{self.config.api_base}{path}"
-        headers = self._build_headers()
-        cookie = self._get_cookie_header()
-        if cookie:
-            headers["Cookie"] = cookie
+        """统一请求方法：GET 缓存 → 全局限速 → 瞬态错误退避重试 → 错误分类"""
+        cache_key = None
+        if method == "GET" and throttle.CACHE_ENABLED:
+            params = kwargs.get("params") or {}
+            cache_key = f"{path}?{sorted((str(k), str(v)) for k, v in params.items())}"
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                return cached
 
-        try:
-            resp = await self._client.request(
-                method, url, headers=headers, **kwargs
-            )
-            resp.raise_for_status()
-        except httpx.TimeoutException:
-            raise CoolapkError("请求超时")
-        except httpx.ConnectError:
-            raise CoolapkError("无法连接服务器")
-        except httpx.HTTPStatusError as e:
-            raise CoolapkError(f"HTTP {e.response.status_code}")
+        url = f"{self.config.api_base}{path}"
+        resp = None
+        last_err: CoolapkError | None = None
+        for attempt in range(throttle.MAX_RETRIES + 1):
+            await self._limiter.acquire()
+            headers = self._build_headers()
+            cookie = self._get_cookie_header()
+            if cookie:
+                headers["Cookie"] = cookie
+            err: CoolapkError | None = None
+            try:
+                resp = await self._client.request(
+                    method, url, headers=headers, **kwargs
+                )
+                resp.raise_for_status()
+                break
+            except httpx.TimeoutException:
+                err = CoolapkError("请求超时", kind="network")
+            except httpx.ConnectError:
+                err = CoolapkError("无法连接服务器", kind="network")
+            except httpx.HTTPStatusError as e:
+                code = e.response.status_code
+                kind = "transient" if (code >= 500 or code == 429) else "http"
+                err = CoolapkError(f"HTTP {code}", kind=kind)
+            if err is not None and err.kind not in ("network", "transient"):
+                raise err
+            last_err = err
+            if attempt < throttle.MAX_RETRIES:
+                await throttle.backoff_sleep(attempt)
+
+        if resp is None:
+            raise last_err or CoolapkError("请求失败", kind="network")
 
         try:
             result = resp.json()
         except json.JSONDecodeError:
-            raise CoolapkError("响应解析失败")
+            # 风控页/网关错误页常返回 HTML
+            raise CoolapkError("响应解析失败", kind="parse")
 
         # 检查业务错误
         if "data" not in result and "message" in result:
@@ -89,9 +173,26 @@ class CoolapkClient:
             message = result.get("message", "未知错误")
             if isinstance(error_code, str):
                 error_code = int(error_code) if error_code.lstrip("-").isdigit() else -1
+            if "验证码" in message or "captcha" in message.lower():
+                # 负缓存：该端点短期内已被风控，冷却期内不再请求
+                base = path.split("?", 1)[0]
+                self._blocked[base] = time.monotonic() + self.CAPTCHA_COOLDOWN
+                raise CoolapkError(message, error_code, kind="captcha")
             raise CoolapkError(message, error_code)
 
-        return result.get("data")
+        data = result.get("data")
+        if isinstance(data, list):
+            self._index_feeds(data)
+        if cache_key is not None:
+            self._cache.put(cache_key, data, throttle.ttl_for(path))
+        return data
+
+    def _endpoint_blocked(self, base: str) -> bool:
+        until = self._blocked.get(base, 0.0)
+        if until and time.monotonic() < until:
+            return True
+        self._blocked.pop(base, None)
+        return False
 
     async def get(self, path: str, params: dict | None = None) -> Any:
         return await self._request("GET", path, params=params)
@@ -184,6 +285,107 @@ class CoolapkClient:
         return await self.get(
             f"/v6/feed/hotReplyList?id={feed_id}&page={page}&discussMode=1"
         )
+
+    async def get_all_replies(
+        self, feed_id: int, max_pages: int = 30
+    ) -> list[dict]:
+        """拉取全部一级评论（自动翻页去重；楼中楼已内联在每条的 replyRows 里）。
+
+        max_pages 是安全上限，防止超大帖（数千评论）把请求预算耗尽；
+        超过上限时返回已取到的部分，调用方可对照 replynum 总数判断是否截断。
+        """
+        all_replies: list[dict] = []
+        seen: set[str] = set()
+        for page in range(1, max_pages + 1):
+            replies = await self.get_feed_replies(feed_id, page)
+            if not isinstance(replies, list) or not replies:
+                break
+            new = 0
+            for r in replies:
+                if not isinstance(r, dict):
+                    continue
+                rid = str(r.get("id", ""))
+                if rid and rid in seen:
+                    continue
+                if rid:
+                    seen.add(rid)
+                all_replies.append(r)
+                new += 1
+            if new == 0 or len(replies) < 10:
+                break
+        return all_replies
+
+    async def get_feed_detail_smart(
+        self,
+        feed_id: int,
+        author_uid: int | None = None,
+        with_replies: bool = True,
+        reply_page: int = 1,
+        all_replies: bool = False,
+    ) -> dict:
+        """动态详情（带风控回落）
+
+        /v6/feed/detail 被验证码拦截时，自动改从作者动态列表取帖子全文；
+        回复走独立的 replyList 接口（通常不受详情接口风控影响）。
+
+        Args:
+            feed_id: 帖子ID
+            author_uid: 作者UID（提供则回落更快；不提供则查本地 feed_id→uid 索引）
+            with_replies: 是否带回复
+            reply_page: 回复页码
+
+        Returns:
+            {"source": "api"|"author_feed_fallback", "data": dict, "replies": list|None}
+        """
+        detail_raw = None
+        source = "api"
+        if not self._endpoint_blocked("/v6/feed/detail"):
+            try:
+                raw = await self.get_feed_detail(feed_id)
+                if isinstance(raw, list) and raw:
+                    raw = raw[0]
+                if isinstance(raw, dict):
+                    detail_raw = raw
+            except CoolapkError as e:
+                if e.kind != "captcha":
+                    raise
+
+        if detail_raw is None:
+            uid = author_uid or self._uid_index.get(feed_id)
+            if not uid:
+                raise CoolapkError(
+                    "帖子详情被验证码拦截，且无作者UID可回落；请提供 author_uid 或先搜索该帖",
+                    kind="captcha",
+                )
+            for page in range(1, self.FALLBACK_SCAN_PAGES + 1):
+                feeds = await self.get_user_feeds(uid, page)
+                if not isinstance(feeds, list):
+                    break
+                for item in feeds:
+                    if isinstance(item, dict) and str(item.get("id")) == str(feed_id):
+                        detail_raw = item
+                        break
+                if detail_raw is not None or len(feeds) < 10:
+                    break
+            if detail_raw is None:
+                raise CoolapkError(
+                    f"帖子详情被验证码拦截，且在作者(uid={uid})前"
+                    f"{self.FALLBACK_SCAN_PAGES}页动态中未找到 id={feed_id}",
+                    kind="captcha",
+                )
+            source = "author_feed_fallback"
+
+        replies = None
+        if with_replies:
+            try:
+                if all_replies:
+                    replies = await self.get_all_replies(feed_id)
+                else:
+                    replies = await self.get_feed_replies(feed_id, reply_page)
+            except CoolapkError:
+                replies = None  # 回复接口也被拦时降级为只返回正文
+
+        return {"source": source, "data": detail_raw, "replies": replies}
 
     # ---- 搜索 ----
 

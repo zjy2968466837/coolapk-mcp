@@ -41,6 +41,15 @@
 
 > 开源自用维护中 · MIT · 当前 **27★ / 5 fork**
 
+## 本 Fork 增强（2026-10-24）
+
+- **风控规避管线**：全局限速（默认 1.2s，`COOLAPK_MIN_INTERVAL`）+ GET TTL 缓存（`COOLAPK_NO_CACHE=1` 关闭）+ 瞬态退避重试 + 验证码负缓存，错误带 `error_type` 分类
+- **数盟 ShuzlmID 设备码**：`auth/device.py` 提供 `encode_device_code/decode_device_code`，用本机官方 App 的 SHUZILM_DID（root 读 prefs）+ 机型参数构造设备码，实测可解除 `feed/detail`、`replyList` 的 `err_request_captcha_v2` 拦截；替代已因多账号风控(-415)被拉黑的公共共享码
+- **详情智能回落**：detail 被风控时自动经 feed_id→uid 索引（持久化）从作者动态列表取正文，`fetch_source` 字段标注来源
+- **搜索质量**：默认严格关键词过滤（归一化匹配、去重、疑似广告标记），`--no-strict` 关闭
+- **全量评论 + 关键词检索**：`coolapk feed <id> --all-replies` / MCP `all_replies=true` 自动翻页拉全部一级评论（楼中楼内联）；`--grep "词1 词2"` / MCP `comment_keyword` 对评论与楼中楼做 OR 检索，命中带 `comment_match` 与 `comment_search` 统计
+- 身份配置仍是 `~/.coolapk-mcp/config.json`（设备码 + Cookie），详见 `coolapk_mcp/auth/device.py` 顶部注释
+
 ## 快速开始
 
 ```bash

@@ -22,3 +22,6 @@ Thumbs.db
 
 # 临时脚本
 scripts/tmp/
+
+# 本地测试产物（含凭据/截图，禁止提交）
+test_out/
